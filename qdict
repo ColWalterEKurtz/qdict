@@ -1,0 +1,372 @@
+#!/bin/bash
+
+# ------------------------------------------------------------------------------
+# settings                                                              settings
+# ------------------------------------------------------------------------------
+set -o errtrace  # any trap on ERR is inherited by shell functions,
+                 #   command substitutions, and commands executed in a subshell
+                 #   environment
+set -o nounset   # treat unset variables and parameters other than the special
+                 #   parameters "@" and "*" as an error when performing
+                 #   parameter expansion
+set -o pipefail  # the return value of a pipeline is the value of the last
+                 #   (rightmost) command to exit with a non-zero status, or
+                 #   zero if all commands in the pipeline exit successfully
+
+# set language
+export LANG="en_US.UTF-8"
+
+# use dot as decimal separator
+export LC_NUMERIC="en_US.UTF-8"
+
+# terminal colors
+readonly    NONE=$(tput sgr0)
+readonly     RED=$(tput setaf 1)
+readonly   GREEN=$(tput setaf 2)
+readonly  YELLOW=$(tput setaf 3)
+readonly    BLUE=$(tput setaf 4)
+readonly MAGENTA=$(tput setaf 5)
+readonly    CYAN=$(tput setaf 6)
+readonly   WHITE=$(tput setaf 7)
+
+# set filename of the local database
+readonly DBFILE="$HOME/.qdict.db"
+
+# ------------------------------------------------------------------------------
+# functions                                                            functions 
+# ------------------------------------------------------------------------------
+
+# -------
+# failmsg
+# -------
+#
+# This function prints a red colored message via stderr.
+#
+function failmsg()
+{
+  # push to stderr
+  echo -e "${RED}[FAIL]${NONE} $1" 1>&2
+}
+
+# -------
+# warnmsg
+# -------
+#
+# This function prints a yellow colored message via stderr.
+#
+function warnmsg()
+{
+  # push to stderr
+  echo -e "${YELLOW}[WARN]${NONE} $1" 1>&2
+}
+
+# -------
+# infomsg
+# -------
+#
+# This function prints a blue colored message via stderr.
+#
+function infomsg()
+{
+  # push to stderr
+  echo -e "${BLUE}[INFO]${NONE} $1" 1>&2
+}
+
+# -------
+# donemsg
+# -------
+#
+# This function prints a green colored message via stderr.
+#
+function donemsg()
+{
+  # push to stderr
+  echo -e "${GREEN}[DONE]${NONE} $1" 1>&2
+}
+
+# --------
+# get_html
+# --------
+#
+# This function pushes the plain html code from the given URL to stdout.
+#
+# $1  URL
+#
+function get_html()
+{
+  # try to get local filename
+  local FILENAME=$(sed -nre "s|^file://(/.+)|\1|p" <<< "$1")
+
+  # local file
+  if [ -n "$FILENAME" ] ; then
+
+    cat "$FILENAME"
+
+  # remote file
+  else
+
+    # send query
+    wget --quiet                \
+         --no-check-certificate \
+         --user-agent=""        \
+         --timeout="60"         \
+         -O -                   \
+         "$1"
+
+  fi
+}
+
+# -----------
+# array2table
+# -----------
+#
+# This function creates a two column table from dict.cc arrays.
+#
+# ... | array2table
+#
+function array2table()
+{
+  # create temporary files (two columns)
+  local LCOL=$(mktemp --suffix=".qdict")
+  local RCOL=$(mktemp --suffix=".qdict")
+
+  sed --quiet           \
+      --regexp-extended \
+      --expression="
+
+        # analyze scripts only
+        /<[Ss][Cc][Rr][Ii][Pp][Tt][^[:alpha:]]/,/<\/[Ss][Cc][Rr][Ii][Pp][Tt][^[:alpha:]]/{
+
+          # use only SPACE as whitespace character
+          s/[[:space:]]+/ /g
+
+          # crop content of c1Arr and c2Arr array
+          s/ *var +c1Arr *= *new +Array *\((.+) *\) *; *$/BEGIN:ARRAY1\x0A\1\x0AEND:ARRAY1/
+          s/ *var +c2Arr *= *new +Array *\((.+) *\) *; *$/BEGIN:ARRAY2\x0A\1\x0AEND:ARRAY2/
+
+          # branch to end of script if no s has made a successful substitution
+          T
+
+          # replace empty entries
+          s/\" *\" *, */\"--------\",/g
+          s/ *,\" *\" */,\"--------\"/g
+
+          # split lines
+          s/\" *, *\"/\x0A/g
+
+          # remove quotation marks
+          s/\x0A\"/\x0A/g
+          s/\"\x0A/\x0A/g
+
+          # unescape special characters
+          s/\\\'/'/g
+
+          # print non-empty lines
+          /[^[:space:]]+/ { p }
+        }
+      "                   \
+  | sed --quiet           \
+        --regexp-extended \
+        --expression="
+
+          /BEGIN:ARRAY1/,/END:ARRAY1/ {
+
+            /BEGIN:ARRAY1/ { d }
+            /END:ARRAY1/ { d }
+
+            w $RCOL
+
+          }
+
+          /BEGIN:ARRAY2/,/END:ARRAY2/ {
+
+            /BEGIN:ARRAY2/ { d }
+            /END:ARRAY2/ { d }
+
+            w $LCOL
+          }
+        "
+
+  # check file size
+  if [ ! -s "$LCOL" ] || [ ! -s "$RCOL" ] ; then
+
+    # notify user
+    failmsg "unable to extract array data"
+
+    # remove temporary files
+    rm "$LCOL" "$RCOL"
+
+    # signalize trouble
+    return 1
+
+  fi
+
+  # merge lines from both files (use TAB as separator)
+  paste "$LCOL" "$RCOL" | sed -re "/--------\x09--------/ d"
+
+  # remove temporary files
+  rm "$LCOL" "$RCOL"
+
+}
+
+# --------
+# add_dots
+# --------
+#
+# ... | add_dots
+#
+function add_dots()
+{
+  # create temporary files (two columns)
+  local LCOL=$(mktemp --suffix=".qdict")
+  local RCOL=$(mktemp --suffix=".qdict")
+
+  # split lines at TAB character
+  sed --quiet           \
+      --regexp-extended \
+      --expression="
+        h
+        s/^([^\x09]+)\x09([^\x09]+)$/\1 ./
+        w $LCOL
+        g
+        s/^([^\x09]+)\x09([^\x09]+)$/\2/
+        w $RCOL
+      "
+
+  # find longst line within the left column
+  local MAXLEN=$(cat "$LCOL" | wc -L)
+
+  # fill up each line with dots
+  sed --in-place        \
+      --regexp-extended \
+      --expression="
+
+        # insert dots
+        :again ; /.{$MAXLEN}/!{ s/$/./; b again }
+
+      " "$LCOL"
+
+  # merge lines from both files
+  paste -d " " "$LCOL" "$RCOL"
+
+  # remove temporary files
+  rm "$LCOL" "$RCOL"
+}
+
+# -------
+# querydb
+# -------
+#
+# $1  the word to query
+#
+function querydb()
+{
+  egrep --ignore-case "$1" "$DBFILE"
+}
+
+# -------
+# querycc
+# -------
+#
+# $1  the word to query
+#
+function querycc()
+{
+  # use first parameter as question
+  local QUERY=$(sed -re "s/[[:space:]]+/+/g" <<< "$1")
+
+  # run query
+  get_html "http://www.dict.cc/?s=$QUERY" | array2table
+}
+
+# -----
+# query
+# -----
+#
+# $1  the word to query
+#
+function query()
+{
+  # this file holds the answer of one query
+  local ANSWER=$(mktemp --suffix=".qdict")
+
+  # show progress
+  infomsg "running local query: $1"
+
+  # query given line (local)
+  querydb "$1" | add_dots
+
+  # show progress
+  infomsg "running remote query: $1"
+
+  # query given line (remote)
+  querycc "$1" > "$ANSWER"
+
+  # check result
+  if [ -s "$ANSWER" ] ; then
+
+    # show local answer
+    cat "$ANSWER" | add_dots
+
+    # update db file
+    cat "$DBFILE" "$ANSWER" | sort --unique --output="$DBFILE"
+
+  else
+
+    # notify user
+    warnmsg "no remote results"
+
+  fi
+
+  # remove temporary file
+  rm -f "$ANSWER"
+}
+
+# ------------------------------------------------------------------------------
+# commands                                                              commands 
+# ------------------------------------------------------------------------------
+
+# check if db file is missing
+if [ ! -f "$DBFILE" ] ; then
+
+  touch "$DBFILE" &>"/dev/null"
+
+  # check if db file is still missing
+  if [ ! -f "$DBFILE" ] ; then
+
+    # notify user
+    failmsg "unable to create db file"
+
+    # signalize trouble
+    return 1
+
+  fi
+
+fi
+
+# no arguments given
+if (( $# == 0 )); then
+
+  # read all lines from stdin
+  while read -r LINE
+  do
+
+    query "$LINE"
+
+  done
+
+else
+
+  # process all given arguments
+  for ARGUMENT in "$@"
+  do
+
+    query "$ARGUMENT"
+
+  done
+
+fi
+
+# signalize success
+exit 0
+
