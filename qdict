@@ -226,7 +226,7 @@ function add_dots()
       --regexp-extended \
       --expression="
         h
-        s/^([^\x09]+)\x09([^\x09]+)$/\1 ./
+        s/^([^\x09]+)\x09([^\x09]+)$/\1/
         w $LCOL
         g
         s/^([^\x09]+)\x09([^\x09]+)$/\2/
@@ -234,16 +234,19 @@ function add_dots()
       "
 
   # find longst line within the left column
-  local MAXLEN=$(cat "$LCOL" | wc -L)
+  local MAXLEN=$(wc -L "$LCOL" | sed -re "s/ .+/+2/" | bc)
+
+  # create line of dots once
+  local MAXINS=$(printf "%${MAXLEN}s\n" " " | tr ' ' '.')
 
   # fill up each line with dots
   sed --in-place        \
       --regexp-extended \
       --expression="
-
-        # insert dots
-        :again ; /.{$MAXLEN}/!{ s/$/./; b again }
-
+        # add dots
+        s/$/ $MAXINS/
+        # remove dotts
+        s/(.{$MAXLEN}).*/\1/
       " "$LCOL"
 
   # merge lines from both files
